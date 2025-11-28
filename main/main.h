@@ -36,7 +36,7 @@
 #define OTA_UPGRADE_MANUFACTURER                                               \
   0x1234 /* Manufacturer code (must match OTA image) */
 #define OTA_UPGRADE_IMAGE_TYPE 0x5679 /* Image type (must match OTA image) */
-#define OTA_UPGRADE_FILE_VERSION 0x00000001 /* Current firmware version */
+#define OTA_UPGRADE_FILE_VERSION 0x00000002 /* Current firmware version */
 #define OTA_UPGRADE_HW_VERSION 0x0001       /* Hardware version */
 #define OTA_UPGRADE_MAX_DATA_SIZE 64        /* OTA image block size */
 
@@ -56,6 +56,16 @@ typedef enum {
           {                                                                    \
               .ed_timeout = ED_AGING_TIMEOUT,                                  \
               .keep_alive = ED_KEEP_ALIVE,                                     \
+          },                                                                   \
+  }
+
+#define ESP_ZB_ZR_CONFIG()                                                     \
+  {                                                                            \
+      .esp_zb_role = ESP_ZB_DEVICE_TYPE_ROUTER,                                \
+      .install_code_policy = INSTALLCODE_POLICY_ENABLE,                        \
+      .nwk_cfg.zczr_cfg =                                                      \
+          {                                                                    \
+              .max_children = 10,                                              \
           },                                                                   \
   }
 

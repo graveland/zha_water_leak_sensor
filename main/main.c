@@ -544,7 +544,7 @@ static void custom_temperature_sensor_ep_create(
 
 static void esp_zb_task(void *pvParameters) {
   /* Initialize Zigbee stack */
-  esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
+  esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZR_CONFIG();
   esp_zb_init(&zb_nwk_cfg);
 
   esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
