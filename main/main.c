@@ -608,6 +608,28 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
             ESP_ZB_BDB_MODE_NETWORK_STEERING);
       } else {
         ESP_LOGI(TAG, "Device rebooted");
+
+        // Check if already enrolled and start heartbeat timer
+        esp_zb_lock_acquire(portMAX_DELAY);
+        esp_zb_zcl_attr_t *zone_id_attr = esp_zb_zcl_get_attribute(
+            HA_ESP_LEAK_START_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_IAS_ZONE,
+            ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_IAS_ZONE_ZONEID_ID);
+        if (zone_id_attr) {
+          ias_zone_id = *(uint8_t *)zone_id_attr->data_p;
+          ESP_LOGI(TAG, "Already enrolled with IAS Zone ID: %d", ias_zone_id);
+
+          // Start heartbeat timer since we're already enrolled
+          if (heartbeat_timer == NULL) {
+            start_heartbeat_timer();
+          }
+
+          // Send current status
+          vTaskDelay(pdMS_TO_TICKS(1000)); // Wait for network to be fully ready
+          bool leak_detected = read_water_leak_state();
+          esp_app_leak_sensor_handler(leak_detected, HA_ESP_LEAK_START_ENDPOINT);
+          ESP_LOGI(TAG, "Sent initial zone status on reboot: %s", leak_detected ? "LEAK" : "NO LEAK");
+        }
+        esp_zb_lock_release();
       }
     } else {
       /* commissioning failed */
