@@ -504,6 +504,15 @@ static void gpio_event_task(void *arg) {
           ESP_LOGI(TAG, "Report cooldown active - suppressing report (total: %lu)",
                    total_suppressed_changes);
 
+          // Update the suppression counter attribute in the Zigbee stack
+          esp_zb_lock_acquire(portMAX_DELAY);
+          esp_zb_zcl_set_attribute_val(HA_ESP_LEAK_START_ENDPOINT,
+                                       ESP_ZB_ZCL_CLUSTER_ID_IAS_ZONE,
+                                       ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                                       SUPPRESSION_COUNTER_ATTR_ID,
+                                       &total_suppressed_changes, false);
+          esp_zb_lock_release();
+
           // Restart cooldown timer (reset to full duration)
           esp_timer_stop(report_cooldown_timer);
           esp_timer_start_once(report_cooldown_timer, REPORT_COOLDOWN_MS * 1000);
