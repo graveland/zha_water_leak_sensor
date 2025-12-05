@@ -9,6 +9,9 @@ This is a Zigbee water leak sensor using the IAS (Intruder Alarm System) Zone cl
 
 - 1x ESP32-C6 (or ESP32-H2)
 - 1x Water leak sensor probe (simple contact closure type)
+- 1x 4.7-20k pull-up resistor to reduce interference / false triggers on the sensor. The built-in pull-up
+  capabilities of the esp aren't good enough- I was getting constant false-positives without an external
+  pull-up added.
 
 The water leak sensor should be a simple two-wire probe that shorts to ground when water is detected.
 
