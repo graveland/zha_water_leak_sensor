@@ -716,16 +716,8 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
                extended_pan_id[1], extended_pan_id[0], esp_zb_get_pan_id(),
                esp_zb_get_current_channel(), esp_zb_get_short_address());
 
-      // Set IAS Zone CIE address to the coordinator's address
-      esp_zb_ieee_addr_t cie_addr;
-      esp_zb_get_long_address(cie_addr);
-      ESP_LOGI(TAG, "Setting IAS CIE address");
-      esp_zb_lock_acquire(portMAX_DELAY);
-      esp_zb_zcl_set_attribute_val(
-          HA_ESP_LEAK_START_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_IAS_ZONE,
-          ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-          ESP_ZB_ZCL_ATTR_IAS_ZONE_IAS_CIE_ADDRESS_ID, cie_addr, false);
-      esp_zb_lock_release();
+      // IAS Zone enrollment: coordinator will set CIE address during interview
+      ESP_LOGI(TAG, "Waiting for coordinator to set IAS CIE address during enrollment");
     } else {
       ESP_LOGI(TAG, "Network steering was not successful (status: %s)",
                esp_err_to_name(err_status));
