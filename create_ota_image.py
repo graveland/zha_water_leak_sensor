@@ -20,7 +20,7 @@ except ImportError:
 # From main.h
 MANUFACTURER_CODE = 0x1234
 IMAGE_TYPE = 0x567a
-DEFAULT_FILE_VERSION = 0x00000001
+DEFAULT_FILE_VERSION = 0x00000008
 
 def create_zigbee_ota_file(input_bin, output_ota, file_version=DEFAULT_FILE_VERSION):
     """Create a Zigbee OTA file from ESP32 binary using zigpy."""
