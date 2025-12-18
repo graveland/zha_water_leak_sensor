@@ -14,6 +14,8 @@
 #include "driver/gpio.h"
 #include "led_strip.h"
 
+#include "nvs_functions.h"
+
 static const char *TAG = "WATER_LEAK_SENSOR";
 
 // IAS Zone status bits
@@ -38,6 +40,13 @@ static esp_timer_handle_t report_cooldown_timer = NULL;
 static bool cooldown_timer_active = false;
 static bool current_gpio_state = false;
 static uint32_t total_suppressed_changes = 0;
+
+// Network watchdog - detect and recover from network disconnection
+static bool network_joined = false;
+static int network_not_joined_count = 0;
+
+// Diagnostics - reset count
+static uint16_t zb_reset_count = 0;
 
 // OTA partition and handle (must be static for persistence across callbacks)
 static const esp_partition_t *s_ota_partition = NULL;
@@ -427,6 +436,21 @@ static void start_heartbeat_timer(void) {
            (int)(HEARTBEAT_INTERVAL_US / 1000000));
 }
 
+static void watchdog_timer_callback(void *arg) {
+    // Network watchdog - reboot if not joined for too long
+    if (network_joined) {
+        network_not_joined_count = 0;
+    } else {
+        network_not_joined_count++;
+        ESP_LOGW(TAG, "Watchdog: Not joined to network (count: %d)", network_not_joined_count);
+        if (network_not_joined_count > 5) {
+            ESP_LOGW(TAG, "Watchdog: Not joined to network for 5+ minutes - factory reset and reboot");
+            esp_zb_factory_reset();
+            esp_restart();
+        }
+    }
+}
+
 static void handle_leak_state_change(bool leak_detected) {
   ESP_LOGI(TAG, "Water leak state changed: %s -> %s",
            last_leak_state ? "LEAK" : "NO LEAK",
@@ -548,6 +572,16 @@ static esp_err_t deferred_driver_init(void) {
   ESP_LOGI(TAG, "Starting GPIO event handler task");
   xTaskCreate(gpio_event_task, "gpio_event_task", 4096, NULL, 10, NULL);
 
+  // Watchdog timer - runs every minute to check for network disconnection
+  ESP_LOGI(TAG, "Starting watchdog timer");
+  const esp_timer_create_args_t watchdog_timer_args = {
+      .callback = &watchdog_timer_callback,
+      .name = "watchdog_timer"
+  };
+  esp_timer_handle_t watchdog_timer;
+  ESP_ERROR_CHECK(esp_timer_create(&watchdog_timer_args, &watchdog_timer));
+  ESP_ERROR_CHECK(esp_timer_start_periodic(watchdog_timer, 60 * 1000000));  // 1 minute
+
   return ESP_OK;
 }
 
@@ -555,8 +589,22 @@ static esp_err_t zb_ias_zone_cluster_attr_handler(
     esp_zb_zcl_set_attr_value_message_t *message) {
   esp_err_t ret = ESP_OK;
 
-  ESP_LOGI(TAG, "Cluster attr write: cluster=0x%x, attr=0x%x",
-           message->info.cluster, message->attribute.id);
+  ESP_LOGI(TAG, "Cluster attr write: cluster=0x%x, attr=0x%x, endpoint=%d",
+           message->info.cluster, message->attribute.id, message->info.dst_endpoint);
+
+  // Handle writes to On/Off cluster on reboot endpoint
+  if (message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
+      message->info.dst_endpoint == HA_ESP_REBOOT_ENDPOINT) {
+    if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
+      bool on_off_value = *(bool *)message->attribute.data.value;
+      if (on_off_value) {
+        ESP_LOGW(TAG, "Reboot switch triggered - rebooting device");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
+      }
+    }
+    return ret;
+  }
 
   if (message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_IDENTIFY) {
     // Handle identify command - attribute 0x0 is identify_time
@@ -673,6 +721,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
         esp_zb_bdb_start_top_level_commissioning(
             ESP_ZB_BDB_MODE_NETWORK_STEERING);
       } else {
+        network_joined = true;
         ESP_LOGI(TAG, "Device rebooted");
 
         // Check if already enrolled and start heartbeat timer
@@ -705,6 +754,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
     break;
   case ESP_ZB_BDB_SIGNAL_STEERING:
     if (err_status == ESP_OK) {
+      network_joined = true;
       esp_zb_ieee_addr_t extended_pan_id;
       esp_zb_get_extended_pan_id(extended_pan_id);
       ESP_LOGI(TAG,
@@ -725,6 +775,10 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
           (esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
           ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
     }
+    break;
+  case ESP_ZB_ZDO_SIGNAL_LEAVE:
+    network_joined = false;
+    ESP_LOGW(TAG, "Left network - will factory reset and reboot on next watchdog");
     break;
   default:
     ESP_LOGI(TAG, "ZDO signal: %s (0x%x), status: %s",
@@ -832,6 +886,14 @@ static esp_zb_cluster_list_t *custom_water_leak_sensor_clusters_create(
   ESP_ERROR_CHECK(esp_zb_cluster_list_add_ota_cluster(
       cluster_list, ota_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE));
 
+  // Add Diagnostics cluster for reset count
+  esp_zb_attribute_list_t *diagnostics_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_DIAGNOSTICS);
+  ESP_ERROR_CHECK(esp_zb_cluster_add_attr(diagnostics_cluster, ESP_ZB_ZCL_CLUSTER_ID_DIAGNOSTICS,
+                                          ESP_ZB_ZCL_ATTR_DIAGNOSTICS_NUMBER_OF_RESETS_ID,
+                                          ESP_ZB_ZCL_ATTR_TYPE_U16, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
+                                          &zb_reset_count));
+  ESP_ERROR_CHECK(esp_zb_cluster_list_add_diagnostics_cluster(cluster_list, diagnostics_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+
   return cluster_list;
 }
 
@@ -846,6 +908,49 @@ static void custom_water_leak_sensor_ep_create(
   esp_zb_cluster_list_t *cluster_list =
       custom_water_leak_sensor_clusters_create(ias_zone_cfg);
   esp_zb_ep_list_add_ep(ep_list, cluster_list, endpoint_config);
+}
+
+static esp_zb_cluster_list_t *reboot_switch_clusters_create(void)
+{
+    esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
+
+    // Add Basic cluster for device identification
+    esp_zb_basic_cluster_cfg_t basic_cfg = {
+        .zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
+        .power_source = 0x01,  // Mains powered
+    };
+    esp_zb_attribute_list_t *basic_cluster = esp_zb_basic_cluster_create(&basic_cfg);
+    ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, MANUFACTURER_NAME));
+    ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, "\x0D""Reboot Switch"));
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_basic_cluster(cluster_list, basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+
+    // Add Identify cluster
+    esp_zb_identify_cluster_cfg_t identify_cfg = {
+        .identify_time = 0,
+    };
+    esp_zb_attribute_list_t *identify_cluster = esp_zb_identify_cluster_create(&identify_cfg);
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_identify_cluster(cluster_list, identify_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+
+    // Add On/Off server cluster for reboot switch
+    esp_zb_on_off_cluster_cfg_t on_off_cfg = {
+        .on_off = ESP_ZB_ZCL_ON_OFF_ON_OFF_DEFAULT_VALUE,
+    };
+    esp_zb_attribute_list_t *on_off_cluster = esp_zb_on_off_cluster_create(&on_off_cfg);
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_on_off_cluster(cluster_list, on_off_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+
+    return cluster_list;
+}
+
+static void reboot_switch_ep_create(esp_zb_ep_list_t *ep_list)
+{
+    esp_zb_endpoint_config_t endpoint_config = {
+        .endpoint = HA_ESP_REBOOT_ENDPOINT,
+        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_ON_OFF_SWITCH_DEVICE_ID,
+        .app_device_version = 0,
+    };
+    esp_zb_cluster_list_t *cluster_list = reboot_switch_clusters_create();
+    esp_zb_ep_list_add_ep(ep_list, cluster_list, endpoint_config);
 }
 
 static void esp_zb_task(void *pvParameters) {
@@ -868,6 +973,9 @@ static void esp_zb_task(void *pvParameters) {
   }
   ESP_LOGI(TAG, "Total water leak sensor endpoints created: %d", HA_ESP_NUM_LEAK_SENSORS);
 
+  // Add reboot switch endpoint
+  reboot_switch_ep_create(ep_list);
+
   // Register OTA upgrade action handler
   esp_zb_core_action_handler_register(esp_zb_action_handler);
 
@@ -889,6 +997,9 @@ void app_main(void) {
   };
   ESP_ERROR_CHECK(nvs_flash_init());
   ESP_ERROR_CHECK(esp_zb_platform_config(&config));
+
+  // Increment and store reset count before Zigbee starts
+  zb_reset_count = increment_and_get_reset_count();
 
   /* Start Zigbee stack task */
   xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
