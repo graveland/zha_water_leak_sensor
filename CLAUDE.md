@@ -1,0 +1,2 @@
+- never build or monitor the device
+- always update graveland_water_leak_sensor.js when making changes that would require it
