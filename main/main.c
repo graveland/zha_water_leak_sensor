@@ -231,7 +231,7 @@ static void init_rgb_led(void) {
   led_strip_config_t strip_config = {
       .strip_gpio_num = RGB_LED_GPIO,
       .max_leds = 1, // Single RGB LED
-      .led_pixel_format = LED_PIXEL_FORMAT_GRB,
+      .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
       .led_model = LED_MODEL_WS2812,
       .flags.invert_out = false,
   };
@@ -987,7 +987,7 @@ static void esp_zb_task(void *pvParameters) {
   esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
   ESP_ERROR_CHECK(esp_zb_start(false));
 
-  esp_zb_main_loop_iteration();
+  esp_zb_stack_main_loop();
 }
 
 void app_main(void) {
