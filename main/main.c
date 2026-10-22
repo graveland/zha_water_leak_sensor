@@ -41,9 +41,13 @@ static bool cooldown_timer_active = false;
 static bool current_gpio_state = false;
 static uint32_t total_suppressed_changes = 0;
 
-// Network watchdog - detect and recover from network disconnection
-static bool network_joined = false;
+// Network watchdog - restart, never wipe, a device that fails to come back
+// onto its network. Only a long run of failed restarts falls back to a
+// factory reset, which erases the bindings.
+#define WATCHDOG_RESTART_AFTER_MINUTES 5
+#define WATCHDOG_FACTORY_RESET_AFTER_RESTARTS 12
 static int network_not_joined_count = 0;
+static bool watchdog_restarts_cleared = false;
 
 // Diagnostics - reset count
 static uint16_t zb_reset_count = 0;
@@ -437,18 +441,37 @@ static void start_heartbeat_timer(void) {
 }
 
 static void watchdog_timer_callback(void *arg) {
-    // Network watchdog - reboot if not joined for too long
-    if (network_joined) {
-        network_not_joined_count = 0;
-    } else {
-        network_not_joined_count++;
-        ESP_LOGW(TAG, "Watchdog: Not joined to network (count: %d)", network_not_joined_count);
-        if (network_not_joined_count > 5) {
-            ESP_LOGW(TAG, "Watchdog: Not joined to network for 5+ minutes - factory reset and reboot");
-            esp_zb_factory_reset();
-            esp_restart();
-        }
+  esp_zb_lock_acquire(portMAX_DELAY);
+  bool joined = esp_zb_bdb_dev_joined();
+  bool factory_new = esp_zb_bdb_is_factory_new();
+  esp_zb_lock_release();
+
+  if (joined) {
+    network_not_joined_count = 0;
+    if (!watchdog_restarts_cleared) {
+      clear_watchdog_restarts();
+      watchdog_restarts_cleared = true;
     }
+    return;
+  }
+
+  if (factory_new) {
+    // Network steering retries itself and there is no state left to protect.
+    return;
+  }
+
+  network_not_joined_count++;
+  ESP_LOGW(TAG, "Watchdog: Not joined to network (count: %d)", network_not_joined_count);
+  if (network_not_joined_count > WATCHDOG_RESTART_AFTER_MINUTES) {
+    uint8_t restarts = increment_watchdog_restarts();
+    if (restarts >= WATCHDOG_FACTORY_RESET_AFTER_RESTARTS) {
+      ESP_LOGW(TAG, "Watchdog: %d restarts without rejoining - factory reset", restarts);
+      clear_watchdog_restarts();
+      esp_zb_factory_reset();
+    }
+    ESP_LOGW(TAG, "Watchdog: Not joined to network for %d minutes - restarting", network_not_joined_count);
+    esp_restart();
+  }
 }
 
 static void handle_leak_state_change(bool leak_detected) {
@@ -700,6 +723,28 @@ esp_zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
   return ret;
 }
 
+// Runs from the Zigbee scheduler, so it must not take the Zigbee lock. The
+// diagnostics cluster has no binding, so address the coordinator directly.
+static void report_reset_count_cb(uint8_t unused) {
+  esp_zb_zcl_report_attr_cmd_t report_attr_cmd = {0};
+  report_attr_cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+  report_attr_cmd.zcl_basic_cmd.dst_addr_u.addr_short = 0x0000;
+  report_attr_cmd.zcl_basic_cmd.dst_endpoint = 1;
+  report_attr_cmd.zcl_basic_cmd.src_endpoint = HA_ESP_LEAK_START_ENDPOINT;
+  report_attr_cmd.clusterID = ESP_ZB_ZCL_CLUSTER_ID_DIAGNOSTICS;
+  report_attr_cmd.attributeID = ESP_ZB_ZCL_ATTR_DIAGNOSTICS_NUMBER_OF_RESETS_ID;
+  report_attr_cmd.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
+
+  esp_err_t err = esp_zb_zcl_report_attr_cmd_req(&report_attr_cmd);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to report reset count: %s", esp_err_to_name(err));
+  }
+}
+
+static void schedule_reset_count_report(void) {
+  esp_zb_scheduler_alarm((esp_zb_callback_t)report_reset_count_cb, 0, 5000);
+}
+
 void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
   uint32_t *p_sg_p = signal_struct->p_app_signal;
   esp_err_t err_status = signal_struct->esp_err_status;
@@ -721,8 +766,8 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
         esp_zb_bdb_start_top_level_commissioning(
             ESP_ZB_BDB_MODE_NETWORK_STEERING);
       } else {
-        network_joined = true;
         ESP_LOGI(TAG, "Device rebooted");
+        schedule_reset_count_report();
 
         // Check if already enrolled and start heartbeat timer
         esp_zb_lock_acquire(portMAX_DELAY);
@@ -754,7 +799,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
     break;
   case ESP_ZB_BDB_SIGNAL_STEERING:
     if (err_status == ESP_OK) {
-      network_joined = true;
       esp_zb_ieee_addr_t extended_pan_id;
       esp_zb_get_extended_pan_id(extended_pan_id);
       ESP_LOGI(TAG,
@@ -765,6 +809,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
                extended_pan_id[4], extended_pan_id[3], extended_pan_id[2],
                extended_pan_id[1], extended_pan_id[0], esp_zb_get_pan_id(),
                esp_zb_get_current_channel(), esp_zb_get_short_address());
+      schedule_reset_count_report();
 
       // IAS Zone enrollment: coordinator will set CIE address during interview
       ESP_LOGI(TAG, "Waiting for coordinator to set IAS CIE address during enrollment");
@@ -776,10 +821,20 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
           ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
     }
     break;
-  case ESP_ZB_ZDO_SIGNAL_LEAVE:
-    network_joined = false;
-    ESP_LOGW(TAG, "Left network - will factory reset and reboot on next watchdog");
+  case ESP_ZB_ZDO_SIGNAL_LEAVE: {
+    // A rejoin-type leave is handled by the stack itself. A reset-type leave
+    // has already cleared the stack's state, so there is nothing to protect.
+    esp_zb_zdo_signal_leave_params_t *leave_params =
+        (esp_zb_zdo_signal_leave_params_t *)esp_zb_app_signal_get_params(p_sg_p);
+    uint8_t leave_type = leave_params ? leave_params->leave_type : ESP_ZB_NWK_LEAVE_TYPE_RESET;
+    ESP_LOGW(TAG, "Left network (leave type: %d)", leave_type);
+    if (leave_type == ESP_ZB_NWK_LEAVE_TYPE_RESET) {
+      esp_zb_scheduler_alarm(
+          (esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
+          ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
+    }
     break;
+  }
   default:
     ESP_LOGI(TAG, "ZDO signal: %s (0x%x), status: %s",
              esp_zb_zdo_signal_to_string(sig_type), sig_type,
