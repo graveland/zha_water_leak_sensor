@@ -1036,8 +1036,69 @@ static void esp_zb_task(void *pvParameters) {
 
   esp_zb_device_register(ep_list);
 
-  // IAS Zone uses zone status change notifications, not periodic reporting
-  // No need to configure reporting info like we do for temperature sensors
+  // Zigbee2MQTT configures reporting for the attributes below, and a
+  // ConfigureReporting for an attribute with no record here creates one with
+  // manufacturer code 0. The stack cannot resolve that record and dereferences
+  // NULL in its reporting timer, so register them first and let the command
+  // update them.
+  esp_zb_zcl_reporting_info_t suppression_reporting_info = {
+      .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
+      .ep = HA_ESP_LEAK_START_ENDPOINT,
+      .cluster_id = ESP_ZB_ZCL_CLUSTER_ID_IAS_ZONE,
+      .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+      .dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+      .dst.endpoint = 1,
+      .u.send_info.min_interval = 60,
+      .u.send_info.max_interval = 3600,
+      .u.send_info.def_min_interval = 60,
+      .u.send_info.def_max_interval = 3600,
+      .u.send_info.delta.u32 = 1,
+      .attr_id = SUPPRESSION_COUNTER_ATTR_ID,
+      .manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
+  };
+  esp_err_t suppression_err = esp_zb_zcl_update_reporting_info(&suppression_reporting_info);
+  if (suppression_err != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to register suppression counter reporting: %s", esp_err_to_name(suppression_err));
+  }
+
+  esp_zb_zcl_reporting_info_t power_reporting_info = {
+      .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
+      .ep = HA_ESP_LEAK_START_ENDPOINT,
+      .cluster_id = ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+      .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+      .dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+      .dst.endpoint = 1,
+      .u.send_info.min_interval = 3600,
+      .u.send_info.max_interval = 65000,
+      .u.send_info.def_min_interval = 3600,
+      .u.send_info.def_max_interval = 65000,
+      .u.send_info.delta.u8 = 10,
+      .attr_id = 0x0021, // BatteryPercentageRemaining
+      .manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
+  };
+  esp_err_t power_err = esp_zb_zcl_update_reporting_info(&power_reporting_info);
+  if (power_err != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to register battery reporting: %s", esp_err_to_name(power_err));
+  }
+
+  esp_zb_zcl_reporting_info_t reboot_reporting_info = {
+      .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
+      .ep = HA_ESP_REBOOT_ENDPOINT,
+      .cluster_id = ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
+      .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+      .dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+      .dst.endpoint = 1,
+      .u.send_info.min_interval = 0,
+      .u.send_info.max_interval = 65000,
+      .u.send_info.def_min_interval = 0,
+      .u.send_info.def_max_interval = 65000,
+      .attr_id = ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID,
+      .manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
+  };
+  esp_err_t reboot_err = esp_zb_zcl_update_reporting_info(&reboot_reporting_info);
+  if (reboot_err != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to register reboot switch reporting: %s", esp_err_to_name(reboot_err));
+  }
 
   esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
   ESP_ERROR_CHECK(esp_zb_start(false));
