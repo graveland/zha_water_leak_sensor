@@ -51,6 +51,7 @@ static bool watchdog_restarts_cleared = false;
 
 // Diagnostics - reset count
 static uint16_t zb_reset_count = 0;
+static bool reset_count_reported = false;
 
 // OTA partition and handle (must be static for persistence across callbacks)
 static const esp_partition_t *s_ota_partition = NULL;
@@ -416,6 +417,27 @@ static bool read_water_leak_state(void) {
   return (level == 0);
 }
 
+// Sent once per boot, after the first heartbeat has gone out so the link is
+// known to be carrying traffic. The diagnostics cluster has no binding, so
+// address the coordinator directly.
+static void report_reset_count(void) {
+  esp_zb_zcl_report_attr_cmd_t report_attr_cmd = {0};
+  report_attr_cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+  report_attr_cmd.zcl_basic_cmd.dst_addr_u.addr_short = 0x0000;
+  report_attr_cmd.zcl_basic_cmd.dst_endpoint = 1;
+  report_attr_cmd.zcl_basic_cmd.src_endpoint = HA_ESP_LEAK_START_ENDPOINT;
+  report_attr_cmd.clusterID = ESP_ZB_ZCL_CLUSTER_ID_DIAGNOSTICS;
+  report_attr_cmd.attributeID = ESP_ZB_ZCL_ATTR_DIAGNOSTICS_NUMBER_OF_RESETS_ID;
+  report_attr_cmd.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
+
+  esp_zb_lock_acquire(portMAX_DELAY);
+  esp_err_t err = esp_zb_zcl_report_attr_cmd_req(&report_attr_cmd);
+  esp_zb_lock_release();
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to report reset count: %s", esp_err_to_name(err));
+  }
+}
+
 static void heartbeat_timer_callback(void *arg) {
   // Send periodic heartbeat to coordinator
   bool current_state = read_water_leak_state();
@@ -426,6 +448,11 @@ static void heartbeat_timer_callback(void *arg) {
   // Re-send current zone status as heartbeat
   uint16_t zone_status = current_state ? IAS_ZONE_STATUS_ALARM1 : 0;
   report_ias_zone_status(HA_ESP_LEAK_START_ENDPOINT, zone_status, ias_zone_id);
+
+  if (!reset_count_reported) {
+    reset_count_reported = true;
+    report_reset_count();
+  }
 }
 
 static void start_heartbeat_timer(void) {
@@ -723,28 +750,6 @@ esp_zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
   return ret;
 }
 
-// Runs from the Zigbee scheduler, so it must not take the Zigbee lock. The
-// diagnostics cluster has no binding, so address the coordinator directly.
-static void report_reset_count_cb(uint8_t unused) {
-  esp_zb_zcl_report_attr_cmd_t report_attr_cmd = {0};
-  report_attr_cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
-  report_attr_cmd.zcl_basic_cmd.dst_addr_u.addr_short = 0x0000;
-  report_attr_cmd.zcl_basic_cmd.dst_endpoint = 1;
-  report_attr_cmd.zcl_basic_cmd.src_endpoint = HA_ESP_LEAK_START_ENDPOINT;
-  report_attr_cmd.clusterID = ESP_ZB_ZCL_CLUSTER_ID_DIAGNOSTICS;
-  report_attr_cmd.attributeID = ESP_ZB_ZCL_ATTR_DIAGNOSTICS_NUMBER_OF_RESETS_ID;
-  report_attr_cmd.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
-
-  esp_err_t err = esp_zb_zcl_report_attr_cmd_req(&report_attr_cmd);
-  if (err != ESP_OK) {
-    ESP_LOGW(TAG, "Failed to report reset count: %s", esp_err_to_name(err));
-  }
-}
-
-static void schedule_reset_count_report(void) {
-  esp_zb_scheduler_alarm((esp_zb_callback_t)report_reset_count_cb, 0, 5000);
-}
-
 void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
   uint32_t *p_sg_p = signal_struct->p_app_signal;
   esp_err_t err_status = signal_struct->esp_err_status;
@@ -767,7 +772,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
             ESP_ZB_BDB_MODE_NETWORK_STEERING);
       } else {
         ESP_LOGI(TAG, "Device rebooted");
-        schedule_reset_count_report();
 
         // Check if already enrolled and start heartbeat timer
         esp_zb_lock_acquire(portMAX_DELAY);
@@ -809,7 +813,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
                extended_pan_id[4], extended_pan_id[3], extended_pan_id[2],
                extended_pan_id[1], extended_pan_id[0], esp_zb_get_pan_id(),
                esp_zb_get_current_channel(), esp_zb_get_short_address());
-      schedule_reset_count_report();
 
       // IAS Zone enrollment: coordinator will set CIE address during interview
       ESP_LOGI(TAG, "Waiting for coordinator to set IAS CIE address during enrollment");
@@ -945,7 +948,8 @@ static esp_zb_cluster_list_t *custom_water_leak_sensor_clusters_create(
   esp_zb_attribute_list_t *diagnostics_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_DIAGNOSTICS);
   ESP_ERROR_CHECK(esp_zb_cluster_add_attr(diagnostics_cluster, ESP_ZB_ZCL_CLUSTER_ID_DIAGNOSTICS,
                                           ESP_ZB_ZCL_ATTR_DIAGNOSTICS_NUMBER_OF_RESETS_ID,
-                                          ESP_ZB_ZCL_ATTR_TYPE_U16, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
+                                          ESP_ZB_ZCL_ATTR_TYPE_U16,
+                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
                                           &zb_reset_count));
   ESP_ERROR_CHECK(esp_zb_cluster_list_add_diagnostics_cluster(cluster_list, diagnostics_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
@@ -1098,6 +1102,28 @@ static void esp_zb_task(void *pvParameters) {
   esp_err_t reboot_err = esp_zb_zcl_update_reporting_info(&reboot_reporting_info);
   if (reboot_err != ESP_OK) {
     ESP_LOGW(TAG, "Failed to register reboot switch reporting: %s", esp_err_to_name(reboot_err));
+  }
+
+  // The one-shot reset count report needs a reporting record for its
+  // attribute. Periodic reporting stays off (max interval 0xFFFF).
+  esp_zb_zcl_reporting_info_t diagnostics_reporting_info = {
+      .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
+      .ep = HA_ESP_LEAK_START_ENDPOINT,
+      .cluster_id = ESP_ZB_ZCL_CLUSTER_ID_DIAGNOSTICS,
+      .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+      .dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+      .dst.endpoint = 1,
+      .u.send_info.min_interval = 0,
+      .u.send_info.max_interval = 0xFFFF,
+      .u.send_info.def_min_interval = 0,
+      .u.send_info.def_max_interval = 0xFFFF,
+      .u.send_info.delta.u16 = 1,
+      .attr_id = ESP_ZB_ZCL_ATTR_DIAGNOSTICS_NUMBER_OF_RESETS_ID,
+      .manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
+  };
+  esp_err_t diag_err = esp_zb_zcl_update_reporting_info(&diagnostics_reporting_info);
+  if (diag_err != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to register reset count reporting: %s", esp_err_to_name(diag_err));
   }
 
   esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
