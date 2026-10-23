@@ -35,7 +35,7 @@
  */
 #define OTA_CHECK_INTERVAL_MINUTES 120      /* how often the stack re-queries the server */
 #define OTA_FIRST_CHECK_DELAY_MS (90 * 1000) /* settle after joining before the first query */
-#define OTA_FIRST_CHECK_JITTER_MS (30 * 60 * 1000) /* spread the fleet out */
+#define OTA_FIRST_CHECK_JITTER_MS (2 * 60 * 60 * 1000) /* spread the fleet over two hours */
 #define OTA_RETRY_MINUTES 5                 /* server not found: try again later */
 
 /* Attribute values in ZCL string format
