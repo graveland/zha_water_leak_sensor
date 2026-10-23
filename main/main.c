@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_ota_ops.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -470,6 +471,7 @@ static void start_heartbeat_timer(void) {
 /* Remote rejoin (endpoint 11): state and forward declaration. */
 static uint16_t zb_rejoin_count = 0;
 static void rejoin_request_async(const char *reason);
+static void ota_schedule_first_check(void);
 
 static void watchdog_timer_callback(void *arg) {
   esp_zb_lock_acquire(portMAX_DELAY);
@@ -819,6 +821,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
             ESP_ZB_BDB_MODE_NETWORK_STEERING);
       } else {
         ESP_LOGI(TAG, "Device rebooted");
+        ota_schedule_first_check();
 
         // Check if already enrolled and start heartbeat timer
         esp_zb_lock_acquire(portMAX_DELAY);
@@ -853,6 +856,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
       esp_zb_ieee_addr_t extended_pan_id;
       esp_zb_get_extended_pan_id(extended_pan_id);
       s_steering_retry_delay_ms = 0;
+      ota_schedule_first_check();
       ESP_LOGI(TAG,
                "Joined network successfully (Extended PAN ID: "
                "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x, PAN ID: 0x%04hx, "
@@ -1120,6 +1124,44 @@ static void rejoin_request_async(const char *reason) {
   }
   esp_timer_stop(rejoin_timer);
   esp_timer_start_once(rejoin_timer, 200 * 1000);
+}
+
+static uint16_t s_ota_cluster_list[] = {ESP_ZB_ZCL_CLUSTER_ID_OTA_UPGRADE};
+
+static void ota_start_checks(uint8_t param);
+
+static void ota_match_server_cb(esp_zb_zdp_status_t zdo_status, uint16_t addr,
+                                uint8_t endpoint, void *user_ctx) {
+  if (zdo_status != ESP_ZB_ZDP_STATUS_SUCCESS) {
+    ESP_LOGW(TAG, "No OTA server found; retrying in %d min", OTA_RETRY_MINUTES);
+    esp_zb_scheduler_alarm((esp_zb_callback_t)ota_start_checks, 0,
+                           OTA_RETRY_MINUTES * 60 * 1000);
+    return;
+  }
+
+  esp_zb_ota_upgrade_client_query_interval_set(HA_ESP_LEAK_START_ENDPOINT, OTA_CHECK_INTERVAL_MINUTES);
+  esp_zb_ota_upgrade_client_query_image_req(addr, endpoint);
+  ESP_LOGI(TAG, "OTA checks every %d min (server 0x%04x, endpoint %d)",
+           OTA_CHECK_INTERVAL_MINUTES, addr, endpoint);
+}
+
+static void ota_start_checks(uint8_t param) {
+  esp_zb_zdo_match_desc_req_param_t req = {
+      .dst_nwk_addr = 0x0000,
+      .addr_of_interest = 0x0000,
+      .profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+      .num_in_clusters = 1,
+      .num_out_clusters = 0,
+      .cluster_list = s_ota_cluster_list,
+  };
+  esp_zb_zdo_match_cluster(&req, ota_match_server_cb, NULL);
+}
+
+static void ota_schedule_first_check(void) {
+  uint32_t delay_ms =
+      OTA_FIRST_CHECK_DELAY_MS + (esp_random() % OTA_FIRST_CHECK_JITTER_MS);
+  esp_zb_scheduler_alarm((esp_zb_callback_t)ota_start_checks, 0, delay_ms);
+  ESP_LOGI(TAG, "OTA check scheduled in %lu s", (unsigned long)(delay_ms / 1000));
 }
 
 static esp_zb_cluster_list_t *rejoin_switch_clusters_create(void)

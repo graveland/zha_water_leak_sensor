@@ -23,6 +23,21 @@
 #define HA_ESP_REJOIN_ENDPOINT 11 /* separate endpoint for the rejoin switch */
 #define REJOIN_MIN_INTERVAL_MS (5 * 60 * 1000) /* ignore further rejoin requests for 5 min */
 
+/* OTA image checks
+ *
+ * Zigbee2MQTT's scheduled OTA, and its "update available" state, are driven by
+ * a QueryNextImageRequest from the device: the coordinator only answers when
+ * the device asks. The stack's own timer is armed at cluster creation with
+ * ESP_ZB_ZCL_OTA_UPGRADE_QUERY_TIMER_COUNT_DEF (24h) and re-armed on every
+ * boot, which is longer than these devices stay up without a reset. Ask
+ * deliberately instead: find the coordinator's OTA server once, set the query
+ * interval, and fire the first query shortly after joining.
+ */
+#define OTA_CHECK_INTERVAL_MINUTES 120      /* how often the stack re-queries the server */
+#define OTA_FIRST_CHECK_DELAY_MS (90 * 1000) /* settle after joining before the first query */
+#define OTA_FIRST_CHECK_JITTER_MS (30 * 60 * 1000) /* spread the fleet out */
+#define OTA_RETRY_MINUTES 5                 /* server not found: try again later */
+
 /* Attribute values in ZCL string format
  * The string should be started with the length of its own.
  */
