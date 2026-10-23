@@ -15,6 +15,19 @@ const fzLocal = {
             }
         },
     },
+    rejoin_count: {
+        cluster: 'haDiagnostic',
+        type: ['attributeReport', 'readResponse'],
+        convert: (model, msg, publish, options, meta) => {
+            // Manufacturer-specific 0xC001; zigbee-herdsman may key unknown
+            // attributes by hex string or by decimal value.
+            for (const key of ['0xc001', '0xC001', '49153']) {
+                if (msg.data[key] !== undefined) {
+                    return {rejoin_count: msg.data[key]};
+                }
+            }
+        },
+    },
 };
 
 const definition = {
@@ -40,16 +53,23 @@ const definition = {
     exposes: [
         e.switch_().withState('state', true).withEndpoint('reboot'),
         e.numeric('reset_count', ea.STATE).withDescription('Number of device resets'),
+        e
+            .switch_()
+            .withState('state', true)
+            .withEndpoint('rejoin')
+            .withDescription('Leave the network and re-steer (send TOGGLE)'),
+        e.numeric('rejoin_count', ea.STATE).withDescription('Number of forced re-joins'),
     ],
     fromZigbee: [
         fz.on_off,
         fzLocal.reset_count,
+        fzLocal.rejoin_count,
     ],
     toZigbee: [
         tz.on_off,
     ],
     endpoint: (device) => {
-        return {reboot: 10};
+        return {reboot: 10, rejoin: 11};
     },
     ota: true,
     configure: async (device, coordinatorEndpoint, logger) => {

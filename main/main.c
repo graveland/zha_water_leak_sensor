@@ -467,6 +467,10 @@ static void start_heartbeat_timer(void) {
            (int)(HEARTBEAT_INTERVAL_US / 1000000));
 }
 
+/* Remote rejoin (endpoint 11): state and forward declaration. */
+static uint16_t zb_rejoin_count = 0;
+static void rejoin_request_async(const char *reason);
+
 static void watchdog_timer_callback(void *arg) {
   esp_zb_lock_acquire(portMAX_DELAY);
   bool joined = esp_zb_bdb_dev_joined();
@@ -599,10 +603,43 @@ static void gpio_event_task(void *arg) {
   }
 }
 
+/* Steering retry backoff.
+ *
+ * The old code retried steering every second and dropped the retry chain
+ * entirely if the stack rejected a start (ESP_RETURN_ON_FALSE). Both are wrong:
+ * a fixed 1 s retry hammers the radio, and a dropped chain leaves the device
+ * off the network until something else restarts it.
+ */
+static uint32_t s_steering_retry_delay_ms = 0;
+
+static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask);
+
+static void steering_retry_schedule(void) {
+  if (s_steering_retry_delay_ms == 0) {
+    s_steering_retry_delay_ms = 1000;
+  } else {
+    s_steering_retry_delay_ms *= 2;
+    if (s_steering_retry_delay_ms > (5 * 60 * 1000)) {
+      s_steering_retry_delay_ms = 5 * 60 * 1000;
+    }
+  }
+  ESP_LOGW(TAG, "Scheduling another steering attempt in %lu ms",
+           (unsigned long)s_steering_retry_delay_ms);
+  esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
+                         ESP_ZB_BDB_MODE_NETWORK_STEERING,
+                         s_steering_retry_delay_ms);
+}
+
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask) {
-  ESP_RETURN_ON_FALSE(esp_zb_bdb_start_top_level_commissioning(mode_mask) ==
-                          ESP_OK,
-                      , TAG, "Failed to start Zigbee bdb commissioning");
+  esp_err_t err = esp_zb_bdb_start_top_level_commissioning(mode_mask);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to start BDB commissioning (mode 0x%x): %s",
+             mode_mask, esp_err_to_name(err));
+    if (mode_mask == ESP_ZB_BDB_MODE_NETWORK_STEERING &&
+        !esp_zb_bdb_dev_joined()) {
+      steering_retry_schedule();
+    }
+  }
 }
 
 static esp_err_t deferred_driver_init(void) {
@@ -643,6 +680,16 @@ static esp_err_t zb_ias_zone_cluster_attr_handler(
            message->info.cluster, message->attribute.id, message->info.dst_endpoint);
 
   // Handle writes to On/Off cluster on reboot endpoint
+  // Remote rejoin switch (stateless: any write to onOff triggers).
+  if (message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
+      message->info.dst_endpoint == HA_ESP_REJOIN_ENDPOINT) {
+    if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
+      ESP_LOGW(TAG, "Rejoin switch triggered");
+      rejoin_request_async("remote switch");
+    }
+    return ret;
+  }
+
   if (message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
       message->info.dst_endpoint == HA_ESP_REBOOT_ENDPOINT) {
     if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
@@ -805,6 +852,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
     if (err_status == ESP_OK) {
       esp_zb_ieee_addr_t extended_pan_id;
       esp_zb_get_extended_pan_id(extended_pan_id);
+      s_steering_retry_delay_ms = 0;
       ESP_LOGI(TAG,
                "Joined network successfully (Extended PAN ID: "
                "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x, PAN ID: 0x%04hx, "
@@ -819,9 +867,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
     } else {
       ESP_LOGI(TAG, "Network steering was not successful (status: %s)",
                esp_err_to_name(err_status));
-      esp_zb_scheduler_alarm(
-          (esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
-          ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
+      steering_retry_schedule();
     }
     break;
   case ESP_ZB_ZDO_SIGNAL_LEAVE: {
@@ -832,9 +878,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
     uint8_t leave_type = leave_params ? leave_params->leave_type : ESP_ZB_NWK_LEAVE_TYPE_RESET;
     ESP_LOGW(TAG, "Left network (leave type: %d)", leave_type);
     if (leave_type == ESP_ZB_NWK_LEAVE_TYPE_RESET) {
-      esp_zb_scheduler_alarm(
-          (esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
-          ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
+      steering_retry_schedule();
     }
     break;
   }
@@ -951,6 +995,12 @@ static esp_zb_cluster_list_t *custom_water_leak_sensor_clusters_create(
                                           ESP_ZB_ZCL_ATTR_TYPE_U16,
                                           ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
                                           &zb_reset_count));
+  // Manufacturer-specific: forced re-joins
+  ESP_ERROR_CHECK(esp_zb_cluster_add_attr(diagnostics_cluster, ESP_ZB_ZCL_CLUSTER_ID_DIAGNOSTICS,
+                                          0xC001,
+                                          ESP_ZB_ZCL_ATTR_TYPE_U16,
+                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
+                                          &zb_rejoin_count));
   ESP_ERROR_CHECK(esp_zb_cluster_list_add_diagnostics_cluster(cluster_list, diagnostics_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
   return cluster_list;
@@ -1012,6 +1062,100 @@ static void reboot_switch_ep_create(esp_zb_ep_list_t *ep_list)
     esp_zb_ep_list_add_ep(ep_list, cluster_list, endpoint_config);
 }
 
+/* Remote/button rejoin (endpoint 11).
+ *
+ * A router has no parent to re-select, but leaving and re-steering rebuilds
+ * its links and forces its children to pick a parent again - the repair for a
+ * node wedged in a bad part of the mesh. It is disruptive (children are
+ * orphaned until they rejoin), so it is rate limited and only ever explicit.
+ */
+static int64_t rejoin_blocked_until_us = 0;
+static esp_timer_handle_t rejoin_timer = NULL;
+static const char *pending_rejoin_reason = NULL;
+
+static void rejoin_now(void) {
+  int64_t now = esp_timer_get_time();
+  if (now < rejoin_blocked_until_us) {
+    ESP_LOGW(TAG, "Rejoin ignored (%llds of rate limit left)",
+             (long long)((rejoin_blocked_until_us - now) / 1000000));
+    return;
+  }
+  rejoin_blocked_until_us = now + (int64_t)REJOIN_MIN_INTERVAL_MS * 1000;
+  zb_rejoin_count++;
+
+  ESP_LOGW(TAG, "Rejoin requested (%s) - leaving the network to re-steer",
+           pending_rejoin_reason ? pending_rejoin_reason : "unknown");
+
+  /* Called from the esp_timer task, not the Zigbee task. */
+  esp_zb_lock_acquire(portMAX_DELAY);
+  esp_zb_zcl_set_attribute_val(HA_ESP_LEAK_START_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_DIAGNOSTICS,
+                               ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, 0xC001,
+                               &zb_rejoin_count, false);
+  if (esp_zb_bdb_dev_joined()) {
+    /* Leave with reset: the LEAVE handler starts steering again. */
+    esp_zb_bdb_reset_via_local_action();
+  } else {
+    esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+  }
+  esp_zb_lock_release();
+}
+
+static void rejoin_timer_callback(void *arg) {
+  rejoin_now();
+}
+
+/* Defer out of the ZCL callback: gives the stack time to acknowledge the
+ * command, and runs the Zigbee calls on a task that can take the stack lock. */
+static void rejoin_request_async(const char *reason) {
+  pending_rejoin_reason = reason;
+  if (rejoin_timer == NULL) {
+    const esp_timer_create_args_t args = {
+        .callback = &rejoin_timer_callback,
+        .name = "rejoin_timer",
+    };
+    if (esp_timer_create(&args, &rejoin_timer) != ESP_OK) {
+      rejoin_now();
+      return;
+    }
+  }
+  esp_timer_stop(rejoin_timer);
+  esp_timer_start_once(rejoin_timer, 200 * 1000);
+}
+
+static esp_zb_cluster_list_t *rejoin_switch_clusters_create(void)
+{
+    esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
+
+    esp_zb_basic_cluster_cfg_t basic_cfg = {
+        .zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
+        .power_source = 0x01,  // Mains powered
+    };
+    esp_zb_attribute_list_t *basic_cluster = esp_zb_basic_cluster_create(&basic_cfg);
+    ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, MANUFACTURER_NAME));
+    ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, MODEL_IDENTIFIER));
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_basic_cluster(cluster_list, basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+
+    esp_zb_on_off_cluster_cfg_t on_off_cfg = {
+        .on_off = ESP_ZB_ZCL_ON_OFF_ON_OFF_DEFAULT_VALUE,
+    };
+    esp_zb_attribute_list_t *on_off_cluster = esp_zb_on_off_cluster_create(&on_off_cfg);
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_on_off_cluster(cluster_list, on_off_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+
+    return cluster_list;
+}
+
+static void rejoin_switch_ep_create(esp_zb_ep_list_t *ep_list)
+{
+    esp_zb_endpoint_config_t endpoint_config = {
+        .endpoint = HA_ESP_REJOIN_ENDPOINT,
+        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_ON_OFF_SWITCH_DEVICE_ID,
+        .app_device_version = 0,
+    };
+    esp_zb_cluster_list_t *cluster_list = rejoin_switch_clusters_create();
+    esp_zb_ep_list_add_ep(ep_list, cluster_list, endpoint_config);
+}
+
 static void esp_zb_task(void *pvParameters) {
   /* Initialize Zigbee stack */
   esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZR_CONFIG();
@@ -1034,6 +1178,7 @@ static void esp_zb_task(void *pvParameters) {
 
   // Add reboot switch endpoint
   reboot_switch_ep_create(ep_list);
+  rejoin_switch_ep_create(ep_list);
 
   // Register OTA upgrade action handler
   esp_zb_core_action_handler_register(esp_zb_action_handler);
